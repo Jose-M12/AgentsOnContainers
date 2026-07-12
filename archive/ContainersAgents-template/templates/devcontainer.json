@@ -1,0 +1,35 @@
+{
+  "name": "Containers Agents",
+  "image": "localhost/containers-agents:node24",
+  "remoteUser": "node",
+  "containerUser": "node",
+  "updateRemoteUserUID": true,
+  "shutdownAction": "stopContainer",
+  "init": true,
+  "runArgs": [
+    "--userns=keep-id",
+    "--security-opt=no-new-privileges",
+    "--restart=no",
+    "--cpus=6",
+    "--memory=12g",
+    "--shm-size=1g",
+    "--pids-limit=2048",
+    "--label=io.jose.containers-agents.managed=true"
+  ],
+  "mounts": [
+    "source=__CONTAINERS_AGENTS_HOME__,target=/home/node,type=bind"
+  ],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "files.watcherExclude": {
+          "**/node_modules/**": true,
+          "**/.git/objects/**": true,
+          "**/dist/**": true,
+          "**/__pycache__/**": true
+        }
+      },
+      "extensions": []
+    }
+  }
+}

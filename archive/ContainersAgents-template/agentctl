@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE="${CONTAINERS_AGENTS_IMAGE:-localhost/containers-agents:node24}"
+MANAGED_LABEL="io.jose.containers-agents.managed=true"
+PROFILE_DEFAULT="${CONTAINERS_AGENTS_PROFILE:-auto}"
+STATE_HOME="${CONTAINERS_AGENTS_HOME:-$ROOT_DIR/state/home}"
+
+log()  { printf '[containers-agents] %s\n' "$*"; }
+warn() { printf '[containers-agents] WARNING: %s\n' "$*" >&2; }
+die()  { printf '[containers-agents] ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./agentctl doctor
+  ./agentctl build
+  ./agentctl shell <project-dir> [auto|battery|balanced|ac]
+  ./agentctl up <project-dir> [auto|battery|balanced|ac]
+  ./agentctl exec <project-dir>
+  ./agentctl down <project-dir>
+  ./agentctl down --all
+  ./agentctl status
+  ./agentctl off-check
+  ./agentctl disable-background
+  ./agentctl init-vscode <project-dir>
+  ./agentctl vscode <project-dir>
+
+Profiles:
+  battery   4 CPUs, 10 GiB RAM, 512 MiB /dev/shm
+  balanced  8 CPUs, 16 GiB RAM, 1 GiB /dev/shm
+  ac       12 CPUs, 22 GiB RAM, 1 GiB /dev/shm
+  auto      selects ac or battery from /sys/class/power_supply
+USAGE
+}
+
+on_ac_power() {
+  local supply type online saw_battery=0
+  shopt -s nullglob
+  for supply in /sys/class/power_supply/*; do
+    [[ -r "$supply/type" ]] || continue
+    type="$(<"$supply/type")"
+    if [[ "$type" == "Battery" ]]; then
+      saw_battery=1
+      continue
+    fi
+    [[ "$type" == "Mains" && -r "$supply/online" ]] || continue
+    online="$(<"$supply/online")"
+    if [[ "$online" == "1" ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  # Machines without a battery are treated as AC-powered.
+  ((saw_battery == 0)) && return 0
+  return 1
+}
+
+select_limits() {
+  local profile="${1:-$PROFILE_DEFAULT}"
+  if [[ "$profile" == "auto" ]]; then
+    if on_ac_power; then profile="ac"; else profile="battery"; fi
+  fi
+
+  case "$profile" in
+    battery)
+      LIMIT_CPUS="${CONTAINERS_AGENTS_CPUS:-4}"
+      LIMIT_MEMORY="${CONTAINERS_AGENTS_MEMORY:-10g}"
+      LIMIT_SHM="${CONTAINERS_AGENTS_SHM:-512m}"
+      ;;
+    balanced)
+      LIMIT_CPUS="${CONTAINERS_AGENTS_CPUS:-8}"
+      LIMIT_MEMORY="${CONTAINERS_AGENTS_MEMORY:-16g}"
+      LIMIT_SHM="${CONTAINERS_AGENTS_SHM:-1g}"
+      ;;
+    ac)
+      LIMIT_CPUS="${CONTAINERS_AGENTS_CPUS:-12}"
+      LIMIT_MEMORY="${CONTAINERS_AGENTS_MEMORY:-22g}"
+      LIMIT_SHM="${CONTAINERS_AGENTS_SHM:-1g}"
+      ;;
+    *) die "Unknown profile: $profile" ;;
+  esac
+  ACTIVE_PROFILE="$profile"
+}
+
+absolute_project() {
+  [[ $# -eq 1 ]] || die "Project directory is required"
+  [[ -d "$1" ]] || die "Project directory does not exist: $1"
+  realpath "$1"
+}
+
+project_key() {
+  printf '%s' "$1" | sha256sum | cut -c1-10
+}
+
+project_name() {
+  local base key
+  base="$(printf '%s' "$(basename -- "$1")" | tr -cs '[:alnum:]_.-' '-')"
+  key="$(project_key "$1")"
+  printf 'ca-%s-%s' "${base:0:28}" "$key"
+}
+
+ensure_state_home() {
+  mkdir -p "$STATE_HOME"/{.cache,.config,.local/bin,.npm-global}
+  chmod 700 "$STATE_HOME"
+  if [[ ! -e "$STATE_HOME/.bashrc" ]]; then
+    cat > "$STATE_HOME/.bashrc" <<'BASHRC'
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+BASHRC
+  fi
+}
+
+ensure_image() {
+  if ! podman image exists "$IMAGE"; then
+    log "Image $IMAGE is missing; building it now."
+    build_image
+  fi
+}
+
+build_image() {
+  need podman
+  podman build \
+    --build-arg "USER_ID=$(id -u)" \
+    --build-arg "GROUP_ID=$(id -g)" \
+    --tag "$IMAGE" \
+    --file "$ROOT_DIR/Containerfile" \
+    "$ROOT_DIR"
+}
+
+common_args() {
+  local project="$1" profile="$2" project_id
+  select_limits "$profile"
+  ensure_state_home
+  project_id="$(project_key "$project")"
+
+  COMMON_ARGS=(
+    --userns=keep-id
+    --security-opt=no-new-privileges
+    --restart=no
+    --init
+    --pids-limit=2048
+    --cpus="$LIMIT_CPUS"
+    --memory="$LIMIT_MEMORY"
+    --shm-size="$LIMIT_SHM"
+    --label="$MANAGED_LABEL"
+    --label="io.jose.containers-agents.project=$project_id"
+    --volume="$project:/workspace:rw"
+    --volume="$STATE_HOME:/home/node:rw"
+    --workdir=/workspace
+    --hostname=containers-agent
+    --env="TERM=${TERM:-xterm-256color}"
+    --env="COLORTERM=${COLORTERM:-truecolor}"
+  )
+}
+
+cmd_doctor() {
+  need podman
+  log "Podman: $(podman --version)"
+  log "Rootless: $(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo unknown)"
+  log "Storage driver: $(podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null || echo unknown)"
+  log "OCI runtime: $(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || echo unknown)"
+  log "Cgroup version: $(podman info --format '{{.Host.CgroupsVersion}}' 2>/dev/null || echo unknown)"
+
+  local major
+  major="$(podman --version | sed -E 's/.* version ([0-9]+).*/\1/')"
+  if [[ "$major" =~ ^[0-9]+$ ]] && (( major < 5 )); then
+    warn "VS Code documents Podman 5+ as the compatible target. CLI mode can still be used; test Dev Containers before changing repositories."
+  fi
+
+  local socket_state service_state linger
+  socket_state="$(systemctl --user is-active podman.socket 2>/dev/null || true)"
+  service_state="$(systemctl --user is-active podman.service 2>/dev/null || true)"
+  linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo unknown)"
+  log "podman.socket: ${socket_state:-inactive}"
+  log "podman.service: ${service_state:-inactive}"
+  log "User lingering: $linger"
+
+  if [[ "$socket_state" == "active" || "$service_state" == "active" || "$linger" == "yes" ]]; then
+    warn "Background Podman activation is enabled. Run: ./agentctl disable-background"
+  fi
+}
+
+cmd_shell() {
+  need podman
+  local project profile name
+  project="$(absolute_project "$1")"
+  profile="${2:-$PROFILE_DEFAULT}"
+  ensure_image
+  common_args "$project" "$profile"
+  name="$(project_name "$project")-shell-$$"
+  log "Starting disposable shell ($ACTIVE_PROFILE profile). It is removed automatically when the shell exits."
+  exec podman run --rm --interactive --tty --name="$name" "${COMMON_ARGS[@]}" "$IMAGE" bash -l
+}
+
+cmd_up() {
+  need podman
+  local project profile name
+  project="$(absolute_project "$1")"
+  profile="${2:-$PROFILE_DEFAULT}"
+  ensure_image
+  common_args "$project" "$profile"
+  name="$(project_name "$project")"
+
+  if podman container exists "$name"; then
+    if [[ "$(podman inspect --format '{{.State.Running}}' "$name")" == "true" ]]; then
+      log "$name is already running."
+      return 0
+    fi
+    podman rm "$name" >/dev/null
+  fi
+
+  podman run --detach --name="$name" "${COMMON_ARGS[@]}" "$IMAGE" >/dev/null
+  log "Started $name ($ACTIVE_PROFILE profile)."
+}
+
+cmd_exec() {
+  need podman
+  local project name
+  project="$(absolute_project "$1")"
+  name="$(project_name "$project")"
+  if ! podman container exists "$name" || [[ "$(podman inspect --format '{{.State.Running}}' "$name")" != "true" ]]; then
+    die "$name is not running. Start it with: ./agentctl up '$project'"
+  fi
+  exec podman exec --interactive --tty "$name" bash -l
+}
+
+cmd_down() {
+  need podman
+  if [[ "${1:-}" == "--all" ]]; then
+    mapfile -t ids < <(podman ps --all --quiet --filter "label=$MANAGED_LABEL")
+    if ((${#ids[@]} == 0)); then
+      log "No managed containers exist."
+      return 0
+    fi
+    podman rm --force --time 10 "${ids[@]}" >/dev/null
+    log "Stopped and removed all managed containers."
+    return 0
+  fi
+
+  local project name
+  project="$(absolute_project "$1")"
+  name="$(project_name "$project")"
+  podman rm --force --time 10 --ignore "$name" >/dev/null
+  log "Stopped and removed $name."
+}
+
+cmd_status() {
+  need podman
+  podman ps --all \
+    --filter "label=$MANAGED_LABEL" \
+    --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+}
+
+cmd_off_check() {
+  need podman
+  local failed=0 socket_state service_state linger
+  mapfile -t running < <(podman ps --quiet --filter "label=$MANAGED_LABEL")
+  if ((${#running[@]})); then
+    warn "Managed containers are still running:"
+    podman ps --filter "label=$MANAGED_LABEL" --format '  {{.Names}}  {{.Status}}'
+    failed=1
+  else
+    log "No managed containers are running."
+  fi
+
+  mapfile -t all_running < <(podman ps --quiet)
+  if ((${#all_running[@]})); then
+    warn "One or more Podman containers are still running (including any unrelated to this controller):"
+    podman ps --format '  {{.Names}}  {{.Status}}  {{.Image}}'
+    failed=1
+  else
+    log "No Podman containers are running."
+  fi
+
+  socket_state="$(systemctl --user is-active podman.socket 2>/dev/null || true)"
+  service_state="$(systemctl --user is-active podman.service 2>/dev/null || true)"
+  linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo unknown)"
+
+  if [[ "$socket_state" == "active" || "$service_state" == "active" ]]; then
+    warn "Podman API activation is active: socket=$socket_state service=$service_state"
+    failed=1
+  else
+    log "Podman API socket/service are inactive."
+  fi
+
+  if [[ "$linger" == "yes" ]]; then
+    warn "User lingering is enabled."
+    failed=1
+  else
+    log "User lingering is not enabled."
+  fi
+
+  if ((failed)); then
+    warn "Run './agentctl down --all' and './agentctl disable-background', then check again."
+    return 1
+  fi
+  log "OFF CHECK PASSED: this setup has no active managed workload or API service."
+}
+
+cmd_disable_background() {
+  need systemctl
+  systemctl --user disable --now podman.socket >/dev/null 2>&1 || true
+  systemctl --user stop podman.service >/dev/null 2>&1 || true
+  loginctl disable-linger "$USER" >/dev/null 2>&1 || warn "Could not disable lingering automatically; run: loginctl disable-linger '$USER'"
+  log "Disabled/stopped the rootless Podman API socket and disabled user lingering."
+  log "Run 'unset DOCKER_HOST' in the current shell, or open a new terminal."
+
+  local file
+  for file in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+    [[ -f "$file" ]] || continue
+    if grep -nE 'DOCKER_HOST=.*podman.*sock' "$file" >/dev/null 2>&1; then
+      warn "Remove the persistent DOCKER_HOST line from $file; it is not needed for this design."
+      grep -nE 'DOCKER_HOST=.*podman.*sock' "$file" >&2 || true
+    fi
+  done
+}
+
+cmd_init_vscode() {
+  local project target template
+  project="$(absolute_project "$1")"
+  target="$project/.devcontainer/devcontainer.json"
+  template="$ROOT_DIR/templates/devcontainer.json"
+  mkdir -p "$project/.devcontainer"
+  if [[ -e "$target" ]]; then
+    die "$target already exists; review it instead of overwriting it."
+  fi
+  sed "s|__CONTAINERS_AGENTS_HOME__|$STATE_HOME|g" "$template" > "$target"
+  log "Created $target"
+  log "Set VS Code setting dev.containers.dockerPath to podman, then use 'Dev Containers: Reopen in Container'."
+}
+
+cmd_vscode() {
+  need code
+  local project
+  project="$(absolute_project "$1")"
+  if [[ ! -f "$project/.devcontainer/devcontainer.json" ]]; then
+    cmd_init_vscode "$project"
+  fi
+  ensure_image
+  code --new-window "$project"
+  log "VS Code launched. The dev container is configured to stop when its window closes."
+  log "After closing it, run './agentctl down --all' for removal and './agentctl off-check' for verification."
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    doctor) shift; cmd_doctor "$@" ;;
+    build) shift; build_image "$@" ;;
+    shell) shift; (($# >= 1)) || die "shell requires a project directory"; cmd_shell "$@" ;;
+    up) shift; (($# >= 1)) || die "up requires a project directory"; cmd_up "$@" ;;
+    exec) shift; (($# >= 1)) || die "exec requires a project directory"; cmd_exec "$@" ;;
+    down) shift; (($# >= 1)) || die "down requires a project directory or --all"; cmd_down "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    off-check) shift; cmd_off_check "$@" ;;
+    disable-background) shift; cmd_disable_background "$@" ;;
+    init-vscode) shift; (($# >= 1)) || die "init-vscode requires a project directory"; cmd_init_vscode "$@" ;;
+    vscode) shift; (($# >= 1)) || die "vscode requires a project directory"; cmd_vscode "$@" ;;
+    -h|--help|help|'') usage ;;
+    *) usage; die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

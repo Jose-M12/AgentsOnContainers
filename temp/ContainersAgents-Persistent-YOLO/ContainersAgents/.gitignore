@@ -1,0 +1,13 @@
+# Persistent agent credentials, caches, histories, and user-installed tools.
+state/*/home/**
+!state/*/home/.gitkeep
+
+# Projects are real host data and should be versioned independently.
+projects/**
+!projects/container-agent-test/
+!projects/container-agent-test/.gitkeep
+
+# Local archives and temporary files.
+*.tar.gz
+*.sha256
+*.bak.*

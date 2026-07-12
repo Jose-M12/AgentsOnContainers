@@ -1,0 +1,42 @@
+{
+  "name": "Containers Agents (__DISTRO__, __PROFILE__)",
+  "image": "__IMAGE__",
+  "remoteUser": "node",
+  "containerUser": "node",
+  "updateRemoteUserUID": false,
+  "shutdownAction": "stopContainer",
+  "init": true,
+  "runArgs": [
+    "--userns=keep-id",
+    "--security-opt=no-new-privileges",
+    "--restart=no",
+    "--cpus=__CPUS__",
+    "--memory=__MEMORY__",
+    "--shm-size=__SHM__",
+    "--pids-limit=2048",
+    "--label=io.jose.containers-agents.managed=true",
+    "--label=io.jose.containers-agents.project=__PROJECT_ID__",
+    "--label=io.jose.containers-agents.distro=__DISTRO__"
+  ],
+  "mounts": [
+    "source=__STATE_HOME__,target=/home/node,type=bind"
+  ],
+  "containerEnv": {
+    "CONTAINERS_AGENTS_DISTRO": "__DISTRO__",
+    "CONTAINERS_AGENTS_PROFILE": "__PROFILE__"
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "files.watcherExclude": {
+          "**/node_modules/**": true,
+          "**/.git/objects/**": true,
+          "**/dist/**": true,
+          "**/__pycache__/**": true,
+          "**/.venv/**": true
+        }
+      },
+      "extensions": []
+    }
+  }
+}

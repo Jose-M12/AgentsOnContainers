@@ -1,0 +1,678 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONTAINERS_AGENTS_CONFIG:-$ROOT_DIR/containers-agents.conf}"
+[[ -r "$CONFIG_FILE" ]] || { printf '[containers-agents] ERROR: Config file not readable: %s\n' "$CONFIG_FILE" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+DISTRO_DEFAULT="${CONTAINERS_AGENTS_DISTRO:-${DEFAULT_DISTRO:-debian}}"
+PROFILE_DEFAULT="${CONTAINERS_AGENTS_PROFILE:-${DEFAULT_PROFILE:-auto}}"
+PROJECT_DEFAULT="${CONTAINERS_AGENTS_PROJECT:-${DEFAULT_PROJECT:-$ROOT_DIR/projects/container-agent-test}}"
+AUTO_STOP_DEFAULT="${CONTAINERS_AGENTS_AUTO_STOP:-${AUTO_STOP_AFTER_SHELL:-1}}"
+STOP_OTHER_DEFAULT="${CONTAINERS_AGENTS_STOP_OTHER:-${STOP_OTHER_DISTRO_ON_START:-1}}"
+INSTALL_AGENT_CLIS="${CONTAINERS_AGENTS_INSTALL_AGENT_CLIS:-1}"
+CODEX_VERSION="${CONTAINERS_AGENTS_CODEX_VERSION:-latest}"
+CLAUDE_CODE_CHANNEL="${CONTAINERS_AGENTS_CLAUDE_CODE_CHANNEL:-stable}"
+CLAUDE_CODE_KEY_FINGERPRINT="${CONTAINERS_AGENTS_CLAUDE_CODE_KEY_FINGERPRINT:-31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE}"
+
+MANAGED_LABEL="io.jose.containers-agents.managed=true"
+GENERATION_LABEL="io.jose.containers-agents.generation=3"
+DISTRO_LABEL_KEY="io.jose.containers-agents.distro"
+PROJECT_LABEL_KEY="io.jose.containers-agents.project"
+
+log()  { printf '[containers-agents] %s\n' "$*"; }
+warn() { printf '[containers-agents] WARNING: %s\n' "$*" >&2; }
+die()  { printf '[containers-agents] ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./agents.sh shell [debian|fedora] [auto|battery|balanced|ac] [--keep-running]
+  ./agents.sh start [debian|fedora] [auto|battery|balanced|ac]
+  ./agents.sh exec [debian|fedora]
+  ./agents.sh stop [debian|fedora|all]
+
+  ./agents.sh build [debian|fedora|all]
+  ./agents.sh image-info [debian|fedora|all]
+  ./agents.sh images
+  ./agents.sh status
+
+  ./agents.sh reset [debian|fedora|all] --yes
+  ./agents.sh rebuild [debian|fedora|all] --yes
+  ./agents.sh migrate-legacy --yes
+
+  ./agents.sh project-path
+  ./agents.sh config
+  ./agents.sh doctor
+  ./agents.sh disable-background
+  ./agents.sh off-check
+  ./agents.sh deep-off
+
+Daily defaults:
+  ./agents.sh shell
+
+That command uses:
+  distribution: Debian
+  access:       passwordless sudo inside a rootless container
+  project:      projects/container-agent-test
+  power:        automatic AC/battery detection
+  lifecycle:    start -> shell -> stop, without removing the container
+
+Examples:
+  ./agents.sh shell                  # Debian, default project, auto power
+  ./agents.sh shell battery          # Debian, battery limits
+  ./agents.sh shell fedora           # Fedora, auto power
+  ./agents.sh shell fedora battery   # Fedora, battery limits
+  ./agents.sh shell --keep-running   # Leave selected container running
+  ./agents.sh stop all               # Stop both; do not remove them
+
+The two persistent containers are:
+  containers-agent-debian
+  containers-agent-fedora
+
+Installed packages in their container filesystems survive stop/start and shell
+exit. They disappear only after reset/recreation. /workspace and /home/node are
+host-backed persistent mounts and survive reset as well.
+USAGE
+}
+
+select_distro() {
+  local distro="${1:-$DISTRO_DEFAULT}"
+  case "$distro" in
+    debian)
+      ACTIVE_DISTRO="debian"
+      IMAGE="${CONTAINERS_AGENTS_IMAGE_DEBIAN:-localhost/containers-agents:debian-node24-yolo}"
+      CONTAINERFILE="$ROOT_DIR/Containerfile.debian"
+      CONTAINER_NAME="containers-agent-debian"
+      STATE_HOME="${CONTAINERS_AGENTS_HOME_DEBIAN:-$ROOT_DIR/state/debian/home}"
+      ;;
+    fedora)
+      ACTIVE_DISTRO="fedora"
+      IMAGE="${CONTAINERS_AGENTS_IMAGE_FEDORA:-localhost/containers-agents:fedora44-yolo}"
+      CONTAINERFILE="$ROOT_DIR/Containerfile.fedora"
+      CONTAINER_NAME="containers-agent-fedora"
+      STATE_HOME="${CONTAINERS_AGENTS_HOME_FEDORA:-$ROOT_DIR/state/fedora/home}"
+      ;;
+    *) die "Unknown distribution: $distro" ;;
+  esac
+  [[ -f "$CONTAINERFILE" ]] || die "Containerfile not found: $CONTAINERFILE"
+}
+
+other_distro() {
+  [[ "$1" == debian ]] && printf 'fedora' || printf 'debian'
+}
+
+on_ac_power() {
+  local supply type online saw_battery=0
+  shopt -s nullglob
+  for supply in /sys/class/power_supply/*; do
+    [[ -r "$supply/type" ]] || continue
+    type="$(<"$supply/type")"
+    if [[ "$type" == Battery ]]; then saw_battery=1; continue; fi
+    [[ "$type" == Mains && -r "$supply/online" ]] || continue
+    online="$(<"$supply/online")"
+    if [[ "$online" == 1 ]]; then shopt -u nullglob; return 0; fi
+  done
+  shopt -u nullglob
+  ((saw_battery == 0)) && return 0
+  return 1
+}
+
+select_limits() {
+  local profile="${1:-$PROFILE_DEFAULT}"
+  if [[ "$profile" == auto ]]; then
+    if on_ac_power; then profile=ac; else profile=battery; fi
+  fi
+  case "$profile" in
+    battery)
+      LIMIT_CPUS="${BATTERY_CPUS:-4}"
+      LIMIT_MEMORY="${BATTERY_MEMORY:-10g}"
+      ;;
+    balanced)
+      LIMIT_CPUS="${BALANCED_CPUS:-8}"
+      LIMIT_MEMORY="${BALANCED_MEMORY:-16g}"
+      ;;
+    ac)
+      LIMIT_CPUS="${AC_CPUS:-12}"
+      LIMIT_MEMORY="${AC_MEMORY:-22g}"
+      ;;
+    *) die "Unknown power profile: $profile" ;;
+  esac
+  LIMIT_SHM="${SHM_SIZE:-1g}"
+  LIMIT_PIDS="${PIDS_LIMIT:-4096}"
+  ACTIVE_PROFILE="$profile"
+}
+
+resolve_project() {
+  mkdir -p "$PROJECT_DEFAULT"
+  PROJECT_PATH="$(realpath "$PROJECT_DEFAULT")"
+  [[ -d "$PROJECT_PATH" ]] || die "Project directory does not exist: $PROJECT_PATH"
+}
+
+parse_runtime_options() {
+  PARSED_DISTRO="$DISTRO_DEFAULT"
+  PARSED_PROFILE="$PROFILE_DEFAULT"
+  PARSED_KEEP_RUNNING=0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      debian|fedora) PARSED_DISTRO="$arg" ;;
+      auto|battery|balanced|ac) PARSED_PROFILE="$arg" ;;
+      --distro=debian|--distro=fedora) PARSED_DISTRO="${arg#*=}" ;;
+      --profile=auto|--profile=battery|--profile=balanced|--profile=ac) PARSED_PROFILE="${arg#*=}" ;;
+      --keep-running) PARSED_KEEP_RUNNING=1 ;;
+      *) die "Unknown runtime option: $arg" ;;
+    esac
+  done
+}
+
+parse_distro_target() {
+  TARGET_DISTRO="${1:-$DISTRO_DEFAULT}"
+  case "$TARGET_DISTRO" in debian|fedora|all) ;; *) die "Unknown target: $TARGET_DISTRO" ;; esac
+}
+
+ensure_state_home() {
+  mkdir -p "$STATE_HOME"/{.cache,.config,.local/bin,.local/share,.npm-global}
+  chmod 700 "$STATE_HOME"
+  if [[ ! -e "$STATE_HOME/.bashrc" ]]; then
+    cat > "$STATE_HOME/.bashrc" <<'BASHRC'
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+export HISTFILE="$HOME/.bash_history"
+export HISTSIZE=20000
+export HISTFILESIZE=50000
+shopt -s histappend
+PROMPT_COMMAND="history -a${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+if [ -n "${CONTAINERS_AGENTS_DISTRO:-}" ]; then
+  PS1='\u@containers-agent-'"${CONTAINERS_AGENTS_DISTRO}"':\w\$ '
+fi
+BASHRC
+  fi
+  if [[ ! -e "$STATE_HOME/.bash_profile" ]]; then
+    cat > "$STATE_HOME/.bash_profile" <<'BASHPROFILE'
+if [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+BASHPROFILE
+  fi
+}
+
+build_one() {
+  local distro="$1"
+  need podman
+  select_distro "$distro"
+  log "Building persistent YOLO $ACTIVE_DISTRO image as $IMAGE"
+  podman build \
+    --pull=always \
+    --build-arg "USER_ID=$(id -u)" \
+    --build-arg "GROUP_ID=$(id -g)" \
+    --build-arg "INSTALL_AGENT_CLIS=$INSTALL_AGENT_CLIS" \
+    --build-arg "CODEX_VERSION=$CODEX_VERSION" \
+    --build-arg "CLAUDE_CODE_CHANNEL=$CLAUDE_CODE_CHANNEL" \
+    --build-arg "CLAUDE_CODE_KEY_FINGERPRINT=$CLAUDE_CODE_KEY_FINGERPRINT" \
+    --tag "$IMAGE" \
+    --file "$CONTAINERFILE" \
+    "$ROOT_DIR"
+}
+
+ensure_image() {
+  local distro="$1"
+  select_distro "$distro"
+  if ! podman image exists "$IMAGE"; then
+    log "Image $IMAGE is missing; building it now."
+    build_one "$distro"
+    select_distro "$distro"
+  fi
+}
+
+container_exists() { podman container exists "$1"; }
+container_running() {
+  container_exists "$1" && [[ "$(podman inspect --format '{{.State.Running}}' "$1")" == true ]]
+}
+
+validate_existing_container() {
+  local expected_project="$1" generation distro mount_text
+  generation="$(podman inspect --format '{{index .Config.Labels "io.jose.containers-agents.generation"}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+  distro="$(podman inspect --format '{{index .Config.Labels "io.jose.containers-agents.distro"}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+  [[ "$generation" == 3 && "$distro" == "$ACTIVE_DISTRO" ]] || die "$CONTAINER_NAME uses an older layout. Run './agents.sh reset $ACTIVE_DISTRO --yes'."
+  mount_text="$(podman inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' "$CONTAINER_NAME")"
+  grep -Fq "$expected_project -> /workspace" <<<"$mount_text" || die "$CONTAINER_NAME has a different /workspace mount. Reset it before changing the configured project."
+  grep -Fq "$STATE_HOME -> /home/node" <<<"$mount_text" || die "$CONTAINER_NAME has a different /home/node mount. Reset it before continuing."
+
+  local current_image_id container_image_id
+  current_image_id="$(podman image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
+  current_image_id="${current_image_id#sha256:}"
+  container_image_id="$(podman inspect "$CONTAINER_NAME" --format '{{.Image}}' 2>/dev/null || true)"
+  if [[ -n "$current_image_id" && -n "$container_image_id" && "$current_image_id" != "$container_image_id" ]]; then
+    warn "$CONTAINER_NAME still uses an older image. Its installed packages remain usable."
+    warn "Run './agents.sh rebuild $ACTIVE_DISTRO --yes' when you want to recreate it from the new image."
+  fi
+}
+
+apply_limits() {
+  if ! podman update \
+      --cpus "$LIMIT_CPUS" \
+      --memory "$LIMIT_MEMORY" \
+      --pids-limit "$LIMIT_PIDS" \
+      "$CONTAINER_NAME" >/dev/null; then
+    warn "Could not update all resource limits on $CONTAINER_NAME. Its creation-time limits remain active."
+  fi
+}
+
+create_container() {
+  local project="$1"
+  select_distro "$ACTIVE_DISTRO"
+  ensure_state_home
+  log "Creating persistent $ACTIVE_DISTRO container $CONTAINER_NAME"
+  podman create \
+    --name "$CONTAINER_NAME" \
+    --userns=keep-id \
+    --restart=no \
+    --init \
+    --pids-limit "$LIMIT_PIDS" \
+    --cpus "$LIMIT_CPUS" \
+    --memory "$LIMIT_MEMORY" \
+    --shm-size "$LIMIT_SHM" \
+    --label "$MANAGED_LABEL" \
+    --label "$GENERATION_LABEL" \
+    --label "$DISTRO_LABEL_KEY=$ACTIVE_DISTRO" \
+    --label "$PROJECT_LABEL_KEY=$project" \
+    --volume "$project:/workspace:rw" \
+    --volume "$STATE_HOME:/home/node:rw" \
+    --workdir /workspace \
+    --hostname "containers-agent-$ACTIVE_DISTRO" \
+    --env "TERM=${TERM:-xterm-256color}" \
+    --env "COLORTERM=${COLORTERM:-truecolor}" \
+    --env "CONTAINERS_AGENTS_DISTRO=$ACTIVE_DISTRO" \
+    "$IMAGE" >/dev/null
+  log "Created $CONTAINER_NAME. Its writable operating-system layer now persists until reset."
+}
+
+ensure_container() {
+  local distro="$1" profile="$2"
+  need podman; need realpath
+  resolve_project
+  select_distro "$distro"
+  select_limits "$profile"
+  ensure_image "$distro"
+  ensure_state_home
+  if container_exists "$CONTAINER_NAME"; then
+    validate_existing_container "$PROJECT_PATH"
+    apply_limits
+  else
+    create_container "$PROJECT_PATH"
+  fi
+}
+
+stop_other_if_configured() {
+  [[ "$STOP_OTHER_DEFAULT" == 1 ]] || return 0
+  local other
+  other="$(other_distro "$ACTIVE_DISTRO")"
+  select_distro "$other"
+  if container_running "$CONTAINER_NAME"; then
+    log "Stopping $CONTAINER_NAME before opening the other distribution on the shared project."
+    podman stop --time 10 "$CONTAINER_NAME" >/dev/null
+  fi
+  select_distro "$ACTIVE_DISTRO_SAVED"
+}
+
+start_selected() {
+  START_WAS_RUNNING=0
+  if container_running "$CONTAINER_NAME"; then
+    START_WAS_RUNNING=1
+  else
+    podman start "$CONTAINER_NAME" >/dev/null
+    log "Started $CONTAINER_NAME ($ACTIVE_PROFILE profile ceiling)."
+  fi
+}
+
+SHELL_CLEANUP_ENABLED=0
+SHELL_CLEANUP_CONTAINER=""
+
+cleanup_active_shell() {
+  if [[ "$SHELL_CLEANUP_ENABLED" == 1 && -n "$SHELL_CLEANUP_CONTAINER" ]] \
+      && container_running "$SHELL_CLEANUP_CONTAINER"; then
+    log "Stopping $SHELL_CLEANUP_CONTAINER; the container and installed packages are preserved."
+    podman stop --time 10 "$SHELL_CLEANUP_CONTAINER" >/dev/null || true
+  fi
+  SHELL_CLEANUP_ENABLED=0
+}
+
+cmd_shell() {
+  parse_runtime_options "$@"
+  ensure_container "$PARSED_DISTRO" "$PARSED_PROFILE"
+  ACTIVE_DISTRO_SAVED="$ACTIVE_DISTRO"
+  stop_other_if_configured
+  select_distro "$ACTIVE_DISTRO_SAVED"
+  local was_running auto_stop rc
+  start_selected
+  was_running="$START_WAS_RUNNING"
+  auto_stop="$AUTO_STOP_DEFAULT"
+  [[ "$PARSED_KEEP_RUNNING" == 1 ]] && auto_stop=0
+
+  SHELL_CLEANUP_CONTAINER="$CONTAINER_NAME"
+  if [[ "$auto_stop" == 1 && "$was_running" == 0 ]]; then
+    SHELL_CLEANUP_ENABLED=1
+  else
+    SHELL_CLEANUP_ENABLED=0
+  fi
+  trap cleanup_active_shell EXIT
+  trap 'cleanup_active_shell; exit 129' HUP
+  trap 'cleanup_active_shell; exit 143' TERM
+
+  log "Opening $ACTIVE_DISTRO shell in $PROJECT_PATH. Passwordless container sudo is enabled."
+  if [[ "$auto_stop" == 1 && "$was_running" == 0 ]]; then
+    log "Exit the shell normally; the container will stop but will not be removed."
+  else
+    log "This shell will leave the container active. Stop it with './agents.sh stop $ACTIVE_DISTRO'."
+  fi
+  set +e
+  podman exec --interactive --tty \
+    --env "CONTAINERS_AGENTS_PROFILE=$ACTIVE_PROFILE" \
+    "$CONTAINER_NAME" bash -l
+  rc=$?
+  set -e
+  cleanup_active_shell
+  trap - EXIT HUP TERM
+  return "$rc"
+}
+
+cmd_start() {
+  parse_runtime_options "$@"
+  [[ "$PARSED_KEEP_RUNNING" == 0 ]] || die "--keep-running is only meaningful with shell"
+  ensure_container "$PARSED_DISTRO" "$PARSED_PROFILE"
+  ACTIVE_DISTRO_SAVED="$ACTIVE_DISTRO"
+  stop_other_if_configured
+  select_distro "$ACTIVE_DISTRO_SAVED"
+  if container_running "$CONTAINER_NAME"; then
+    log "$CONTAINER_NAME is already running."
+  else
+    podman start "$CONTAINER_NAME" >/dev/null
+    log "Started $CONTAINER_NAME. It remains running until './agents.sh stop $ACTIVE_DISTRO'."
+  fi
+}
+
+cmd_exec() {
+  local distro="${1:-$DISTRO_DEFAULT}"
+  case "$distro" in debian|fedora) ;; *) die "exec accepts only debian or fedora" ;; esac
+  select_distro "$distro"
+  container_running "$CONTAINER_NAME" || die "$CONTAINER_NAME is not running. Use './agents.sh start $distro' or './agents.sh shell $distro'."
+  exec podman exec --interactive --tty "$CONTAINER_NAME" bash -l
+}
+
+stop_one() {
+  local distro="$1"
+  select_distro "$distro"
+  if ! container_exists "$CONTAINER_NAME"; then
+    log "$CONTAINER_NAME does not exist."
+  elif container_running "$CONTAINER_NAME"; then
+    podman stop --time 10 "$CONTAINER_NAME" >/dev/null
+    log "Stopped $CONTAINER_NAME; its writable layer and installed packages remain."
+  else
+    log "$CONTAINER_NAME is already stopped."
+  fi
+}
+
+cmd_stop() {
+  local target="${1:-$DISTRO_DEFAULT}"
+  case "$target" in
+    debian|fedora) stop_one "$target" ;;
+    all) stop_one debian; stop_one fedora ;;
+    *) die "stop accepts debian, fedora, or all" ;;
+  esac
+}
+
+cmd_build() {
+  local target="${1:-all}"
+  parse_distro_target "$target"
+  case "$TARGET_DISTRO" in
+    debian|fedora) build_one "$TARGET_DISTRO" ;;
+    all) build_one debian; build_one fedora ;;
+  esac
+}
+
+image_info_one() {
+  local distro="$1"
+  select_distro "$distro"
+  podman image exists "$IMAGE" || die "$IMAGE is not built. Run './agents.sh build $distro'."
+  log "Image information: $distro ($IMAGE)"
+  podman run --rm --entrypoint /bin/bash "$IMAGE" -lc '
+    printf "OS: "; . /etc/os-release; printf "%s %s\n" "$NAME" "$VERSION_ID"
+    printf "Node: "; node --version 2>/dev/null || echo not-installed
+    printf "npm: "; npm --version 2>/dev/null || echo not-installed
+    printf "Python: "; python3 --version 2>/dev/null || echo not-installed
+    printf "Git: "; git --version 2>/dev/null || echo not-installed
+    printf "Codex: "; codex --version 2>/dev/null || echo not-installed
+    printf "Claude: "; claude --version 2>/dev/null || echo not-installed
+    if sudo -n true 2>/dev/null; then echo "sudo: passwordless-enabled"; else echo "sudo: unavailable"; fi
+  '
+}
+
+cmd_image_info() {
+  local target="${1:-all}"
+  parse_distro_target "$target"
+  case "$TARGET_DISTRO" in
+    debian|fedora) image_info_one "$TARGET_DISTRO" ;;
+    all) image_info_one debian; image_info_one fedora ;;
+  esac
+}
+
+cmd_images() {
+  need podman
+  local distro
+  for distro in debian fedora; do
+    select_distro "$distro"
+    if podman image exists "$IMAGE"; then
+      podman image inspect "$IMAGE" --format "$distro\t{{.Id}}\t{{.Size}}\t{{.Created}}\t{{.RepoTags}}"
+    else
+      printf '%s\tNOT BUILT (%s)\n' "$distro" "$IMAGE"
+    fi
+  done
+}
+
+cmd_status() {
+  need podman
+  resolve_project
+  printf 'Default project: %s\n' "$PROJECT_PATH"
+  printf 'Default distro:  %s\n' "$DISTRO_DEFAULT"
+  printf 'Default profile: %s\n\n' "$PROFILE_DEFAULT"
+  printf '%-28s %-9s %-10s %-14s %s\n' NAME DISTRO STATE IMAGE PROJECT
+  local distro state image_name project
+  for distro in debian fedora; do
+    select_distro "$distro"
+    if container_exists "$CONTAINER_NAME"; then
+      state="$(podman inspect --format '{{.State.Status}}' "$CONTAINER_NAME")"
+      image_name="$(podman inspect --format '{{.Config.Image}}' "$CONTAINER_NAME")"
+      project="$(podman inspect --format '{{index .Config.Labels "io.jose.containers-agents.project"}}' "$CONTAINER_NAME")"
+      printf '%-28s %-9s %-10s %-14s %s\n' "$CONTAINER_NAME" "$distro" "$state" "$image_name" "$project"
+    else
+      printf '%-28s %-9s %-10s %-14s %s\n' "$CONTAINER_NAME" "$distro" absent '-' "$PROJECT_PATH"
+    fi
+  done
+}
+
+require_yes() {
+  local found=0 arg
+  for arg in "$@"; do [[ "$arg" == --yes ]] && found=1; done
+  [[ "$found" == 1 ]] || die "This command removes persistent container writable layers. Rerun with --yes after reviewing the warning."
+}
+
+reset_one() {
+  local distro="$1"
+  select_distro "$distro"
+  if container_exists "$CONTAINER_NAME"; then
+    podman rm --force --time 10 "$CONTAINER_NAME" >/dev/null
+    log "Removed $CONTAINER_NAME. The project and $STATE_HOME were preserved."
+  else
+    log "$CONTAINER_NAME does not exist."
+  fi
+}
+
+cmd_reset() {
+  local target="${1:-$DISTRO_DEFAULT}"; shift || true
+  require_yes "$@"
+  parse_distro_target "$target"
+  warn "Reset discards packages and operating-system changes installed interactively inside the selected container(s)."
+  case "$TARGET_DISTRO" in
+    debian|fedora) reset_one "$TARGET_DISTRO" ;;
+    all) reset_one debian; reset_one fedora ;;
+  esac
+}
+
+cmd_rebuild() {
+  local target="${1:-all}"; shift || true
+  require_yes "$@"
+  parse_distro_target "$target"
+  warn "Rebuild replaces the image and removes selected persistent container writable layers."
+  case "$TARGET_DISTRO" in
+    debian|fedora) build_one "$TARGET_DISTRO"; reset_one "$TARGET_DISTRO" ;;
+    all) build_one debian; build_one fedora; reset_one debian; reset_one fedora ;;
+  esac
+  log "The next shell/start command will recreate the selected container(s) from the rebuilt image(s)."
+}
+
+cmd_migrate_legacy() {
+  require_yes "$@"
+  need podman
+  mapfile -t legacy < <(podman ps --all --format '{{.Names}}' --filter "label=$MANAGED_LABEL" \
+    | grep -Ev '^(containers-agent-debian|containers-agent-fedora)$' || true)
+  if ((${#legacy[@]} == 0)); then log "No legacy managed containers found."; return 0; fi
+  warn "Removing legacy safe/disposable controller containers: ${legacy[*]}"
+  podman rm --force --time 10 "${legacy[@]}" >/dev/null
+  log "Legacy containers removed. Project directories and state folders were not deleted."
+}
+
+cmd_project_path() {
+  resolve_project
+  printf '%s\n' "$PROJECT_PATH"
+}
+
+cmd_config() {
+  resolve_project
+  cat <<EOF2
+config file:          $CONFIG_FILE
+default project:      $PROJECT_PATH
+default distribution: $DISTRO_DEFAULT
+default power profile:$PROFILE_DEFAULT
+auto-stop shell:      $AUTO_STOP_DEFAULT
+stop other distro:    $STOP_OTHER_DEFAULT
+battery ceiling:      ${BATTERY_CPUS:-4} CPU / ${BATTERY_MEMORY:-10g}
+balanced ceiling:     ${BALANCED_CPUS:-8} CPU / ${BALANCED_MEMORY:-16g}
+AC ceiling:           ${AC_CPUS:-12} CPU / ${AC_MEMORY:-22g}
+shared memory limit:  ${SHM_SIZE:-1g}
+process limit:        ${PIDS_LIMIT:-4096}
+EOF2
+}
+
+cmd_doctor() {
+  need podman; need realpath
+  resolve_project
+  log "Podman: $(podman --version)"
+  log "Rootless: $(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo unknown)"
+  log "Storage driver: $(podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null || echo unknown)"
+  log "OCI runtime: $(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || echo unknown)"
+  log "Cgroup version: $(podman info --format '{{.Host.CgroupsVersion}}' 2>/dev/null || echo unknown)"
+  log "Default project: $PROJECT_PATH"
+  log "Default distribution/profile: $DISTRO_DEFAULT/$PROFILE_DEFAULT"
+  log "Access model: persistent rootless containers with passwordless container sudo"
+
+  local socket_state socket_enabled service_state system_socket_state system_socket_enabled system_service_state linger
+  socket_state="$(systemctl --user is-active podman.socket 2>/dev/null || true)"
+  socket_enabled="$(systemctl --user is-enabled podman.socket 2>/dev/null || true)"
+  service_state="$(systemctl --user is-active podman.service 2>/dev/null || true)"
+  system_socket_state="$(systemctl is-active podman.socket 2>/dev/null || true)"
+  system_socket_enabled="$(systemctl is-enabled podman.socket 2>/dev/null || true)"
+  system_service_state="$(systemctl is-active podman.service 2>/dev/null || true)"
+  linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo unknown)"
+  log "user podman.socket: $socket_state ($socket_enabled)"
+  log "user podman.service: $service_state"
+  log "system podman.socket: $system_socket_state ($system_socket_enabled)"
+  log "system podman.service: $system_service_state"
+  log "User lingering: $linger"
+
+  [[ "$socket_state" != active && "$socket_enabled" != enabled && "$service_state" != active && "$linger" != yes ]] \
+    || warn "Rootless background activation is enabled. Run './agents.sh disable-background'."
+  [[ "$system_socket_state" != active && "$system_socket_enabled" != enabled && "$system_service_state" != active ]] \
+    || warn "A rootful Podman system unit is active or enabled. Disable it manually if not needed."
+
+  local distro
+  for distro in debian fedora; do
+    select_distro "$distro"
+    if podman image exists "$IMAGE"; then log "$distro image: present ($IMAGE)"; else log "$distro image: not built ($IMAGE)"; fi
+    if container_exists "$CONTAINER_NAME"; then
+      log "$distro container: $(podman inspect --format '{{.State.Status}}' "$CONTAINER_NAME") ($CONTAINER_NAME)"
+    else
+      log "$distro container: not created ($CONTAINER_NAME)"
+    fi
+  done
+}
+
+cmd_disable_background() {
+  systemctl --user disable --now podman.socket >/dev/null 2>&1 || true
+  systemctl --user stop podman.service >/dev/null 2>&1 || true
+  loginctl disable-linger "$USER" >/dev/null 2>&1 || true
+  log "Disabled/stopped the rootless Podman API socket and disabled user lingering."
+  log "Run 'unset DOCKER_HOST' in the current shell, or open a new terminal."
+}
+
+cmd_off_check() {
+  need podman
+  local failed=0
+  mapfile -t running_managed < <(podman ps --quiet --filter "label=$MANAGED_LABEL")
+  if ((${#running_managed[@]})); then warn "Managed containers are running."; failed=1; else log "No managed containers are running; stopped persistent containers are allowed."; fi
+  mapfile -t running_all < <(podman ps --quiet)
+  if ((${#running_all[@]})); then warn "Other rootless Podman containers are running."; failed=1; else log "No rootless Podman containers are running."; fi
+
+  local socket_state socket_enabled service_state system_socket_state system_socket_enabled system_service_state linger
+  socket_state="$(systemctl --user is-active podman.socket 2>/dev/null || true)"
+  socket_enabled="$(systemctl --user is-enabled podman.socket 2>/dev/null || true)"
+  service_state="$(systemctl --user is-active podman.service 2>/dev/null || true)"
+  system_socket_state="$(systemctl is-active podman.socket 2>/dev/null || true)"
+  system_socket_enabled="$(systemctl is-enabled podman.socket 2>/dev/null || true)"
+  system_service_state="$(systemctl is-active podman.service 2>/dev/null || true)"
+  linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo unknown)"
+
+  if [[ "$socket_state" == active || "$socket_enabled" == enabled || "$service_state" == active ]]; then warn "Rootless Podman API activation remains active/enabled."; failed=1; else log "Rootless Podman API socket/service are inactive and the socket is not enabled."; fi
+  if [[ "$system_socket_state" == active || "$system_socket_enabled" == enabled || "$system_service_state" == active ]]; then warn "Rootful Podman API activation remains active/enabled."; failed=1; else log "Rootful Podman system socket/service are inactive and the socket is not enabled."; fi
+  if [[ "$linger" == yes ]]; then warn "User lingering is enabled."; failed=1; else log "User lingering is not enabled."; fi
+
+  ((failed == 0)) || die "OFF CHECK FAILED. Stop containers and disable remaining activation units."
+  log "OFF CHECK PASSED: no container workload or Podman API activation remains."
+}
+
+cmd_deep_off() {
+  cmd_off_check
+  log "Stopping Podman's rootless namespace pause process with 'podman system migrate'."
+  podman system migrate
+  log "Deep off completed. Do not run another Podman command if you want the pause process to remain stopped."
+}
+
+main() {
+  local cmd="${1:-help}"
+  case "$cmd" in
+    shell) shift; cmd_shell "$@" ;;
+    start|up) shift; cmd_start "$@" ;;
+    exec) shift; cmd_exec "$@" ;;
+    stop|down) shift; cmd_stop "$@" ;;
+    build) shift; cmd_build "$@" ;;
+    image-info) shift; cmd_image_info "$@" ;;
+    images) shift; (($# == 0)) || die "images accepts no arguments"; cmd_images ;;
+    status) shift; (($# == 0)) || die "status accepts no arguments"; cmd_status ;;
+    reset) shift; (($# >= 1)) || die "reset requires a target and --yes"; cmd_reset "$@" ;;
+    rebuild) shift; (($# >= 1)) || die "rebuild requires a target and --yes"; cmd_rebuild "$@" ;;
+    migrate-legacy) shift; cmd_migrate_legacy "$@" ;;
+    project-path) shift; (($# == 0)) || die "project-path accepts no arguments"; cmd_project_path ;;
+    config) shift; (($# == 0)) || die "config accepts no arguments"; cmd_config ;;
+    doctor) shift; (($# == 0)) || die "doctor accepts no arguments"; cmd_doctor ;;
+    disable-background) shift; (($# == 0)) || die "disable-background accepts no arguments"; cmd_disable_background ;;
+    off-check) shift; (($# == 0)) || die "off-check accepts no arguments"; cmd_off_check ;;
+    deep-off) shift; (($# == 0)) || die "deep-off accepts no arguments"; cmd_deep_off ;;
+    help|-h|--help|'') usage ;;
+    *) usage; die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

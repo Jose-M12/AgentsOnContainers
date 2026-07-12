@@ -1,0 +1,37 @@
+FROM quay.io/fedora/fedora-minimal:42
+
+# Performance-optimized minimal image for Claude, Codex, Grok-style agents
+# Using root inside for max speed (isolation still strong via limited mount + rootless host)
+
+RUN microdnf -y update && \
+    microdnf -y install \
+        git \
+        curl \
+        tar \
+        gzip \
+        which \
+        procps-ng \
+        python3 \
+        python3-pip \
+        nodejs \
+        npm \
+    && microdnf clean all
+
+# Create non-root user if you prefer (uncomment for extra safety, small perf cost)
+# ARG USERNAME=agent
+# RUN groupadd -g 1000 $USERNAME && useradd -u 1000 -g 1000 -m $USERNAME
+# USER $USERNAME
+# WORKDIR /workspace
+
+WORKDIR /workspace
+
+# Cache-friendly env
+ENV PIP_NO_CACHE_DIR=1
+ENV NPM_CONFIG_CACHE=/tmp/.npm
+
+# Add your agent CLIs here (examples):
+# RUN pip install --user anthropic openai
+# RUN npm install -g @anthropic-ai/claude-code   # if exists
+# Or install your specific Codex/Grok CLI
+
+# Keep image tiny for fast cold starts on your NVMe

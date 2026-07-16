@@ -51,6 +51,15 @@ RUN set -eux; \
     printf 'node ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/90-containers-agents-node; \
     chmod 0440 /etc/sudoers.d/90-containers-agents-node
 
+# Fedora ships /etc/shadow and /etc/gshadow as mode 0000. Full systems rely on
+# CAP_DAC_OVERRIDE so root can still read them; rootless container root does not
+# have that capability, so pam_unix fails with "cannot retrieve authentication
+# info" and passwordless sudo never reaches the NOPASSWD rule. Owner-readable
+# modes restore shadow lookup without weakening the sudoers policy.
+RUN set -eu; \
+    chmod 0400 /etc/shadow /etc/gshadow; \
+    su -s /bin/bash node -c 'sudo -n true'
+
 COPY extras/install-fedora.sh /tmp/containers-agents-install-extra.sh
 RUN chmod 0755 /tmp/containers-agents-install-extra.sh \
     && /tmp/containers-agents-install-extra.sh \

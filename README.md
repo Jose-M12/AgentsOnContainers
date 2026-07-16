@@ -134,7 +134,8 @@ Stop it when finished:
 
 ## Documentation
 
-- `docs/TECHNICAL_ARCHITECTURE.md`
-- `docs/SETUP_AND_USAGE.md`
-- `docs/PERSISTENCE_STORAGE_AND_SECURITY.md`
-- `docs/MIGRATION_FROM_SAFE_YOLO.md`
+- `docs/TECHNICAL_ARCHITECTURE.md` — detailed technical and architectural report
+- `docs/SETUP_AND_USAGE.md` — full setup and usage (Ubuntu and macOS)
+- `docs/CHEATSHEET.md` — daily commands after setup
+
+Older drafts and superseded reports live under `archive/docs-outdated/`.
